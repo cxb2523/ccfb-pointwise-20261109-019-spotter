@@ -1,0 +1,120 @@
+apiVersion: rules.spotter.dev/v1alpha1
+kind: SpotterRule
+metadata:
+  name: spotter-workload-011
+  labels:
+    severity: "medium"
+    category: "workload"
+  annotations:
+    rules.spotter.dev/title: "Escape-Risk hostPath Mount or Host Namespace Sharing"
+    rules.spotter.dev/version: "1.0.0"
+    rules.spotter.dev/description: "Detects workloads that mount high-risk host paths (/, /var/run/docker.sock, /proc, /sys or their subpaths) via hostPath, or that share the host's network/PID/IPC namespace (hostNetwork, hostPID, hostIPC), without the stronger privileged-container + docker.sock combination covered by spotter-workload-010 (which is CRITICAL). These mounts and namespace shares weaken container isolation and are frequently a stepping stone to full container escape when combined with other misconfigurations."
+    rules.spotter.dev/cwe: "CWE-668"
+    rules.spotter.dev/author: "Security Team"
+spec:
+  match:
+    resources:
+      kubernetes:
+        apiGroups:
+          - ""
+          - "apps"
+          - "batch"
+        versions:
+          - "v1"
+          - "v1beta1"
+        kinds:
+          - "Pod"
+          - "Deployment"
+          - "StatefulSet"
+          - "DaemonSet"
+          - "Job"
+          - "CronJob"
+        namespaces:
+          include: ["*"]
+          exclude:
+            - "kube-system"
+            - "kube-public"
+            - "kube-node-lease"
+
+  # Same PodSpec-normalization pattern as spotter-workload-010, reused verbatim so this
+  # rule covers Pod / Deployment / StatefulSet / DaemonSet / Job / CronJob with one
+  # expression. A violation here means an escape-risk condition is present (sensitive
+  # hostPath mount of /, /var/run/docker.sock, /proc(/*), /sys(/*), or hostNetwork /
+  # hostPID / hostIPC), AND the stricter CRITICAL condition from spotter-workload-010
+  # (a privileged/CAP_SYS_ADMIN container that itself mounts docker.sock) does NOT hold.
+  # This keeps the two rules mutually exclusive: the same resource is never flagged as
+  # both MEDIUM and CRITICAL for the same underlying risk.
+  cel: |
+    (
+      (
+        (object.kind == 'Pod') ? [object.spec] :
+        (object.kind == 'CronJob') ? (has(object.spec.jobTemplate.spec.template.spec) ? [object.spec.jobTemplate.spec.template.spec] : []) :
+        (has(object.spec.template.spec) ? [object.spec.template.spec] : [])
+      ).exists(ps,
+        (has(ps.volumes) ? ps.volumes : []).exists(v,
+          has(v.hostPath) && has(v.hostPath.path) && (
+            v.hostPath.path == '/' ||
+            v.hostPath.path == '/var/run/docker.sock' ||
+            v.hostPath.path == '/proc' ||
+            v.hostPath.path.startsWith('/proc/') ||
+            v.hostPath.path == '/sys' ||
+            v.hostPath.path.startsWith('/sys/')
+          )
+        ) ||
+        (has(ps.hostNetwork) && ps.hostNetwork == true) ||
+        (has(ps.hostPID) && ps.hostPID == true) ||
+        (has(ps.hostIPC) && ps.hostIPC == true)
+      )
+    ) && !(
+      (
+        (object.kind == 'Pod') ? [object.spec] :
+        (object.kind == 'CronJob') ? (has(object.spec.jobTemplate.spec.template.spec) ? [object.spec.jobTemplate.spec.template.spec] : []) :
+        (has(object.spec.template.spec) ? [object.spec.template.spec] : [])
+      ).exists(ps,
+        ((has(ps.containers) ? ps.containers : []) + (has(ps.initContainers) ? ps.initContainers : [])).exists(c,
+          has(c.securityContext) && (
+            (has(c.securityContext.privileged) && c.securityContext.privileged == true) ||
+            (has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) &&
+              c.securityContext.capabilities.add.exists(cap, cap == 'SYS_ADMIN'))
+          ) &&
+          has(c.volumeMounts) && c.volumeMounts.exists(vm, has(vm.name) &&
+            (has(ps.volumes) ? ps.volumes : []).exists(v,
+              has(v.name) && v.name == vm.name &&
+              has(v.hostPath) && has(v.hostPath.path) && v.hostPath.path == '/var/run/docker.sock'
+            )
+          )
+        )
+      )
+    )
+
+  remediation:
+    manual: |
+      This workload shares a sensitive host resource with the node, which weakens the
+      isolation between the container and the host:
+
+      1. Remove hostPath volumes that mount "/", "/var/run/docker.sock", "/proc" or
+         "/sys" (or any subpath of these) unless there is a specific, documented
+         operational need (e.g. a node-monitoring DaemonSet). Prefer narrowly scoped
+         subpaths or dedicated device plugins/CSI drivers instead.
+      2. Remove `hostNetwork`, `hostPID`, and `hostIPC` unless required; they let the
+         container observe or interact with host-level network traffic, processes, or
+         IPC primitives belonging to other workloads and the node itself.
+      3. If this workload also runs a privileged or CAP_SYS_ADMIN container that mounts
+         /var/run/docker.sock specifically, see spotter-workload-010 (CRITICAL) for the
+         higher-severity combined finding.
+
+      Example fix:
+      ```yaml
+      spec:
+        hostNetwork: false
+        hostPID: false
+        hostIPC: false
+        # avoid hostPath volumes for "/", "/proc", "/sys", "/var/run/docker.sock"
+      ```
+  references:
+    - title: "Kubernetes Pod Security Standards (Restricted)"
+      url: "https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted"
+    - title: "CIS Kubernetes Benchmark - 5.2.2/5.2.3/5.2.4 Host namespace sharing"
+      url: "https://www.cisecurity.org/benchmark/kubernetes"
+    - title: "NIST SP 800-190 - Container Security Guide"
+      url: "https://csrc.nist.gov/publications/detail/sp/800-190/final"

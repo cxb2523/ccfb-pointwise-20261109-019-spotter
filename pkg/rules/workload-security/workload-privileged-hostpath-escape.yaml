@@ -1,0 +1,103 @@
+apiVersion: rules.spotter.dev/v1alpha1
+kind: SpotterRule
+metadata:
+  name: spotter-workload-010
+  labels:
+    severity: "critical"
+    category: "workload"
+  annotations:
+    rules.spotter.dev/title: "Privileged Container Mounting Docker Socket (Container Escape)"
+    rules.spotter.dev/version: "1.0.0"
+    rules.spotter.dev/description: "Detects a privileged (or equivalently capability-escalated, e.g. CAP_SYS_ADMIN) container that also mounts the host's /var/run/docker.sock via hostPath. This combination lets the container control the host's container runtime directly, which is one of the most reliable known container-to-host escape primitives."
+    rules.spotter.dev/cwe: "CWE-250"
+    rules.spotter.dev/author: "Security Team"
+spec:
+  match:
+    resources:
+      kubernetes:
+        apiGroups:
+          - ""
+          - "apps"
+          - "batch"
+        versions:
+          - "v1"
+          - "v1beta1"
+        kinds:
+          - "Pod"
+          - "Deployment"
+          - "StatefulSet"
+          - "DaemonSet"
+          - "Job"
+          - "CronJob"
+        namespaces:
+          include: ["*"]
+          exclude:
+            - "kube-system"
+            - "kube-public"
+            - "kube-node-lease"
+
+  # This single CEL expression is reused unchanged across Pod, Deployment, StatefulSet,
+  # DaemonSet, Job and CronJob: it first normalizes the resource's PodSpec location
+  # ("object.spec" for Pod, "object.spec.template.spec" for the other workloads,
+  # "object.spec.jobTemplate.spec.template.spec" for CronJob) into a single-element list
+  # (or an empty list if that path is absent), then runs the same check against it.
+  #
+  # The violation requires BOTH of the following to hold for the SAME container:
+  #   1. The container is privileged, or has capabilities.add containing SYS_ADMIN
+  #      (an equivalent escape-capable privilege), checked across containers AND
+  #      initContainers.
+  #   2. That same container has a volumeMount whose name resolves (by exact volume
+  #      name match) to a volume with hostPath.path exactly equal to
+  #      "/var/run/docker.sock" - not a string/substring match on the mount path, so
+  #      paths like "/var/log/not-docker.sock-backup" or mounts of unrelated volumes
+  #      on a privileged container do not trigger this rule.
+  cel: |
+    (
+      (object.kind == 'Pod') ? [object.spec] :
+      (object.kind == 'CronJob') ? (has(object.spec.jobTemplate.spec.template.spec) ? [object.spec.jobTemplate.spec.template.spec] : []) :
+      (has(object.spec.template.spec) ? [object.spec.template.spec] : [])
+    ).exists(ps,
+      ((has(ps.containers) ? ps.containers : []) + (has(ps.initContainers) ? ps.initContainers : [])).exists(c,
+        has(c.securityContext) && (
+          (has(c.securityContext.privileged) && c.securityContext.privileged == true) ||
+          (has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) &&
+            c.securityContext.capabilities.add.exists(cap, cap == 'SYS_ADMIN'))
+        ) &&
+        has(c.volumeMounts) && c.volumeMounts.exists(vm, has(vm.name) &&
+          (has(ps.volumes) ? ps.volumes : []).exists(v,
+            has(v.name) && v.name == vm.name &&
+            has(v.hostPath) && has(v.hostPath.path) && v.hostPath.path == '/var/run/docker.sock'
+          )
+        )
+      )
+    )
+
+  remediation:
+    manual: |
+      This workload combines a privileged (or CAP_SYS_ADMIN) container with a hostPath
+      mount of /var/run/docker.sock. Either privilege alone is risky; together they give
+      the container a direct path to compromise the node:
+
+      1. Remove `privileged: true` from the container's securityContext, or drop the
+         SYS_ADMIN capability, unless it is strictly required.
+      2. Remove the hostPath volume/volumeMount pointing at /var/run/docker.sock. If the
+         workload needs to build or manage containers, use a rootless/daemonless
+         alternative (e.g. Kaniko, Buildah) instead of mounting the host Docker socket.
+      3. If Docker-in-Docker access is unavoidable, isolate it to a dedicated, tightly
+         scoped node pool and restrict access with NetworkPolicies, seccomp/AppArmor
+         profiles, and RBAC rather than relying on in-cluster workloads.
+
+      Example fix:
+      ```yaml
+      securityContext:
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+      ```
+  references:
+    - title: "Kubernetes Pod Security Standards (Restricted)"
+      url: "https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted"
+    - title: "CIS Kubernetes Benchmark - 5.1.5 Minimize the admission of privileged containers"
+      url: "https://www.cisecurity.org/benchmark/kubernetes"
+    - title: "Container Breakout via Docker Socket Mount"
+      url: "https://securityboulevard.com/2021/04/escaping-docker-containers-using-waitid-cve-2017-5123/"
